@@ -1,4 +1,5 @@
 import os
+import random
 
 # turn this on later, once Whisper has downloaded its model one time
 # os.environ["HF_HUB_OFFLINE"] = "1"
@@ -9,6 +10,19 @@ from rank_bm25 import BM25Okapi
 
 MANUALS_FOLDER = "manuals"
 CHUNK_WORDS = 150
+
+# heads up: these limits are made-up demo numbers, NOT real NASA limits
+SENSORS = {
+    "co2":          {"start": 3000, "danger": "high", "caution": 5000, "warning": 7000, "unit": "ppm"},
+    "o2":           {"start": 20.9, "danger": "low",  "caution": 19.5, "warning": 18,   "unit": "%"},
+    "pressure":     {"start": 101,  "danger": "low",  "caution": 96,   "warning": 90,   "unit": "kPa"},
+    "cabin_temp":   {"start": 22,   "danger": "high", "caution": 27,   "warning": 32,   "unit": "C"},
+    "battery":      {"start": 90,   "danger": "low",  "caution": 30,   "warning": 15,   "unit": "%"},
+    "coolant_temp": {"start": 18,   "danger": "high", "caution": 30,   "warning": 38,   "unit": "C"},
+}
+
+# green / yellow / red dot for each level
+EMOJI = {"OK": "🟢", "CAUTION": "🟡", "WARNING": "🔴"}
 
 
 # read all the PDFs once and keep the chunks in memory
@@ -101,6 +115,92 @@ def answer(question):
     return reply_text, excerpts_used
 
 
+# compare a reading against that sensor's limits
+def get_level(name, value):
+    s = SENSORS[name]
+    if s["danger"] == "high":
+        if value >= s["warning"]:
+            return "WARNING"
+        if value >= s["caution"]:
+            return "CAUTION"
+    else:
+        if value <= s["warning"]:
+            return "WARNING"
+        if value <= s["caution"]:
+            return "CAUTION"
+    return "OK"
+
+
+# every sensor begins at its start number
+def start_values():
+    values = {}
+    for name in SENSORS:
+        values[name] = SENSORS[name]["start"]
+    return values
+
+
+# nudge every sensor a little, runs once a second
+def step():
+    values = st.session_state["values"]
+    for name in SENSORS:
+        start = SENSORS[name]["start"]
+        if name == "battery":
+            # battery only goes down, slowly
+            values[name] = max(0, values[name] - 0.02)
+        elif name == "co2" and st.session_state["co2_fault"]:
+            # scrubber is broken so co2 keeps climbing
+            values[name] = values[name] + 60 + random.uniform(-10, 10)
+        else:
+            # small wobble, pulled back toward normal so nothing alerts by accident
+            wiggle = start * random.uniform(-0.002, 0.002)
+            values[name] = values[name] + wiggle + (start - values[name]) * 0.1
+
+
+# big numbers look cleaner without decimals
+def nice_number(value):
+    if value >= 100:
+        return str(round(value))
+    return str(round(value, 1))
+
+
+# names of the sensors that are red right now
+def sensors_at_warning():
+    names = []
+    for name in SENSORS:
+        if get_level(name, st.session_state["values"][name]) == "WARNING":
+            names.append(name)
+    return names
+
+
+# reruns by itself every second without wiping the chat
+@st.fragment(run_every=1)
+def dashboard():
+    step()
+    for name in SENSORS:
+        value = st.session_state["values"][name]
+        level = get_level(name, value)
+        st.metric(EMOJI[level] + " " + name, nice_number(value) + " " + SENSORS[name]["unit"])
+
+
+# red box at the top when anything hits WARNING
+@st.fragment(run_every=1)
+def warning_banner():
+    names = sensors_at_warning()
+    if len(names) > 0:
+        st.error("WARNING: " + ", ".join(names))
+
+
+# demo button: pretend the CO2 scrubber just broke
+def inject_fault():
+    st.session_state["co2_fault"] = True
+
+
+# demo button: fix the scrubber and put CO2 back to normal
+def clear_fault():
+    st.session_state["co2_fault"] = False
+    st.session_state["values"]["co2"] = SENSORS["co2"]["start"]
+
+
 # hide the default person and robot icons next to chat messages
 st.markdown(
     """
@@ -117,6 +217,14 @@ st.markdown(
 st.title("Offline Space Copilot, NOVA")
 st.caption("NOVA runs fully offline on this laptop. No internet, no cloud.")
 
+# sensor readings and the fault switch, set up once
+if "values" not in st.session_state:
+    st.session_state["values"] = start_values()
+if "co2_fault" not in st.session_state:
+    st.session_state["co2_fault"] = False
+
+warning_banner()
+
 chunks, pdf_count = load_manuals()
 
 # show what got loaded in the sidebar
@@ -126,6 +234,14 @@ if pdf_count == 0:
 else:
     st.sidebar.write("PDFs loaded: " + str(pdf_count))
     st.sidebar.write("Chunks loaded: " + str(len(chunks)))
+
+# live ship status and the demo fault buttons
+with st.sidebar:
+    st.header("Ship status (simulated)")
+    dashboard()
+    # on_click runs before the page redraws, so the change shows up right away
+    st.button("Inject CO2 scrubber fault", on_click=inject_fault)
+    st.button("Clear fault", on_click=clear_fault)
 
 # keep the chat history between reruns
 if "messages" not in st.session_state:
