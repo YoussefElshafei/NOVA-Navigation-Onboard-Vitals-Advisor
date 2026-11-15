@@ -1,3 +1,7 @@
+# NOVA is read-only. Nothing in this app writes to or commands the ship.
+# It only reads the manuals and the simulated sensors, and gives advice.
+# The crew makes every decision.
+
 import os
 import random
 
@@ -21,16 +25,20 @@ NOT_FOUND = "I can't find that in the loaded manuals."
 # the rules the LLM has to follow every time
 SYSTEM_RULES = """You are NOVA, a read-only assistant on a spacecraft.
 Rules:
-- Answer ONLY using the manual excerpts below. Do not use outside knowledge.
-- Start your answer with "According to the manual," and only say that once.
+- Answer ONLY using the manual excerpts and the LIVE SHIP STATUS below. Do not use outside knowledge.
+- For questions about the ship's status, use ONLY the LIVE SHIP STATUS block and quote its numbers.
+- If any sensor is CAUTION or WARNING, say so, and point to a matching manual excerpt if there is one.
+- If the user asks you to DO something (shut down, vent, turn on, fire, reset), say you cannot take actions,
+then give a suggestion labeled "Suggested - crew decides", with the manual citation if there is one.
+- When you use the manual excerpts, start your answer with "According to the manual," and only say that once.
 - Keep the answer to 3 sentences at most, not counting the source line.
-- End with one last line listing every excerpt label you used, each in its own square brackets, for example:
+- If you used any excerpts, end with one last line listing every excerpt label you used, each in its own square brackets, for example:
 This came directly from [ochmo-tb-002-eclss.pdf p.9] and [ochmo-tb-004-carbon-dioxide.pdf p.8].
 - If you give any advice, label it "Suggested - crew decides".
 - Never claim you did anything yourself. You cannot control or change the ship.
 - If the user asks a follow-up like "where does it say that?", use the previous answer and give its sources again in the same format.
 - If the excerpts cover the question even partly, answer with what they say.
-- Only if the excerpts have nothing relevant at all, reply exactly: I can't find that in the loaded manuals."""
+- Only if neither the excerpts nor the LIVE SHIP STATUS have anything relevant, reply exactly: I can't find that in the loaded manuals."""
 
 # heads up: these limits are made-up demo numbers, NOT real NASA limits
 SENSORS = {
@@ -41,6 +49,9 @@ SENSORS = {
     "battery":      {"start": 90,   "danger": "low",  "caution": 30,   "warning": 15,   "unit": "%"},
     "coolant_temp": {"start": 18,   "danger": "high", "caution": 30,   "warning": 38,   "unit": "C"},
 }
+
+# if a question has one of these (or a sensor name), it's about the ship, so we don't refuse it
+STATUS_WORDS = ["status", "how is", "how's", "current"]
 
 # green / yellow / red dot for each level
 EMOJI = {"OK": "🟢", "CAUTION": "🟡", "WARNING": "🔴"}
@@ -160,8 +171,16 @@ def get_keywords(question):
 # all the reply logic lives here so later phases can reuse it
 # previous_question and previous_reply are the last turn, so follow-ups like "where does it say that?" work
 def answer(question, previous_question="", previous_reply=""):
-    # mix in the last question so a follow-up still finds the same pages
+    # status questions skip the refusal, and so does anything asked while an alarm is on
+    # (so "what should I do?" still works during the CO2 fault)
+    alerts = alert_sensors()
+    status_question = is_status_question(question) or len(alerts) > 0
+
+    # mix in the last question so a follow-up still finds the same pages,
+    # plus any sensor that's acting up so its manual pages come up too
     search_text = previous_question + " " + question
+    for name in alerts:
+        search_text = search_text + " " + name.replace("_", " ")
 
     # search with the question AND the keywords, so we don't lose the original words
     keywords = get_keywords(search_text)
@@ -172,7 +191,10 @@ def answer(question, previous_question="", previous_reply=""):
     # best match is too weak, so refuse instead of letting the LLM guess
     best_score = results[0][1]
     if best_score < MIN_SCORE:
-        return NOT_FOUND, []
+        if not status_question:
+            return NOT_FOUND, []
+        # weak match but it's about the ship, so answer from the live numbers with no excerpts
+        results = []
 
     # glue the 3 excerpts together, each with its [file p.N] label
     excerpts_text = ""
@@ -182,7 +204,15 @@ def answer(question, previous_question="", previous_reply=""):
         excerpts_text = excerpts_text + label + "\n" + chunk[2] + "\n\n"
         excerpts_used.append(chunk)
 
-    system_text = SYSTEM_RULES + "\n\nManual excerpts:\n\n" + excerpts_text
+    if excerpts_text == "":
+        excerpts_text = "(none)\n"
+
+    # the LLM gets the rules, the live sensor numbers, then the manual excerpts
+    system_text = (
+        SYSTEM_RULES
+        + "\n\nLIVE SHIP STATUS:\n" + status_text()
+        + "\n\nManual excerpts:\n\n" + excerpts_text
+    )
 
     # give the LLM the last turn too, if there was one
     user_text = question
@@ -267,6 +297,38 @@ def sensors_at_warning():
         if get_level(name, st.session_state["values"][name]) == "WARNING":
             names.append(name)
     return names
+
+
+# one line per sensor, this is what the LLM sees as LIVE SHIP STATUS
+def status_text():
+    lines = []
+    for name in SENSORS:
+        value = st.session_state["values"][name]
+        unit = SENSORS[name]["unit"]
+        level = get_level(name, value)
+        lines.append(name + ": " + nice_number(value) + " " + unit + " (" + level + ")")
+    return "\n".join(lines)
+
+
+# names of the sensors that are yellow or red right now
+def alert_sensors():
+    names = []
+    for name in SENSORS:
+        if get_level(name, st.session_state["values"][name]) != "OK":
+            names.append(name)
+    return names
+
+
+# true if the question is about the ship itself, so we skip the MIN_SCORE refusal
+def is_status_question(question):
+    q = question.lower()
+    for word in STATUS_WORDS:
+        if word in q:
+            return True
+    for name in SENSORS:
+        if name in q or name.replace("_", " ") in q:
+            return True
+    return False
 
 
 # reruns by itself every second without wiping the chat
@@ -354,6 +416,7 @@ for message in st.session_state["messages"]:
 
 # when the user sends something, show it, answer it, and save both
 question = st.chat_input("Ask NOVA about the manuals")
+st.caption("Read-only assistant: it advises, the crew decides.")
 if question:
     # grab the last question and answer before we add the new one
     previous_question = ""
