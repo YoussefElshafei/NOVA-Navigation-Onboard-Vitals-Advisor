@@ -84,6 +84,36 @@ def search(question):
     return results
 
 
+# all the reply logic lives here so later phases can reuse it
+# for now it just hands back the best chunk with its [file p.N] label
+def answer(question):
+    results = search(question)
+    if len(results) == 0:
+        return "No manuals loaded, so there is nothing to search.", []
+
+    top_chunk = results[0][0]
+    file_name = top_chunk[0]
+    page_number = top_chunk[1]
+    text = top_chunk[2]
+
+    reply_text = text + " [" + file_name + " p." + str(page_number) + "]"
+    excerpts_used = [top_chunk]
+    return reply_text, excerpts_used
+
+
+# hide the default person and robot icons next to chat messages
+st.markdown(
+    """
+    <style>
+    [data-testid="stChatMessageAvatarUser"],
+    [data-testid="stChatMessageAvatarAssistant"] {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Offline Space Copilot, NOVA")
 st.caption("NOVA runs fully offline on this laptop. No internet, no cloud.")
 
@@ -97,15 +127,23 @@ else:
     st.sidebar.write("PDFs loaded: " + str(pdf_count))
     st.sidebar.write("Chunks loaded: " + str(len(chunks)))
 
-# simple search box, no LLM yet, just shows the matching chunks
-question = st.text_input("Ask a question about the manuals")
+# keep the chat history between reruns
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+
+# draw all the old messages first
+for message in st.session_state["messages"]:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+# when the user sends something, show it, answer it, and save both
+question = st.chat_input("Ask NOVA about the manuals")
 if question:
-    results = search(question)
-    if len(results) == 0:
-        st.info("No manuals loaded, so there is nothing to search.")
-    for chunk, score in results:
-        file_name = chunk[0]
-        page_number = chunk[1]
-        text = chunk[2]
-        st.markdown("**" + file_name + "**, page " + str(page_number) + ", score " + str(round(score, 2)))
-        st.write(text)
+    with st.chat_message("user"):
+        st.write(question)
+    st.session_state["messages"].append({"role": "user", "content": question})
+
+    reply_text, excerpts_used = answer(question)
+    with st.chat_message("assistant"):
+        st.write(reply_text)
+    st.session_state["messages"].append({"role": "assistant", "content": reply_text})
