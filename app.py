@@ -1,12 +1,18 @@
+# NOVA is read-only. Nothing in this app writes to or commands the ship.
+# It only reads the manuals and the simulated sensors, and gives advice.
+# The crew makes every decision.
+
 import os
 import io
 import hashlib
 import threading
+import random
 
 # turn this on later, once Whisper has downloaded its model one time
 # os.environ["HF_HUB_OFFLINE"] = "1"
 
 import streamlit as st
+import ollama
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from faster_whisper import WhisperModel
@@ -15,6 +21,46 @@ import pythoncom  # comes with pyttsx3 on windows
 
 MANUALS_FOLDER = "manuals"
 CHUNK_WORDS = 150
+MODEL_NAME = "llama3.1:8b"
+
+# if the best search score is under this, we say "can't find it" instead of asking the LLM
+MIN_SCORE = 2.0
+
+NOT_FOUND = "I can't find that in the loaded manuals."
+
+# the rules the LLM has to follow every time
+SYSTEM_RULES = """You are NOVA, a read-only assistant on a spacecraft.
+Rules:
+- Answer ONLY using the manual excerpts and the LIVE SHIP STATUS below. Do not use outside knowledge.
+- For questions about the ship's status, use ONLY the LIVE SHIP STATUS block and quote its numbers.
+- If any sensor is CAUTION or WARNING, say so, and point to a matching manual excerpt if there is one.
+- If the user asks you to DO something (shut down, vent, turn on, fire, reset), say you cannot take actions,
+then give a suggestion labeled "Suggested - crew decides", with the manual citation if there is one.
+- When you use the manual excerpts, start your answer with "According to the manual," and only say that once.
+- Keep the answer to 3 sentences at most, not counting the source line.
+- If you used any excerpts, end with one last line listing every excerpt label you used, each in its own square brackets, for example:
+This came directly from [ochmo-tb-002-eclss.pdf p.9] and [ochmo-tb-004-carbon-dioxide.pdf p.8].
+- If you give any advice, label it "Suggested - crew decides".
+- Never claim you did anything yourself. You cannot control or change the ship.
+- If the user asks a follow-up like "where does it say that?", use the previous answer and give its sources again in the same format.
+- If the excerpts cover the question even partly, answer with what they say.
+- Only if neither the excerpts nor the LIVE SHIP STATUS have anything relevant, reply exactly: I can't find that in the loaded manuals."""
+
+# heads up: these limits are made-up demo numbers, NOT real NASA limits
+SENSORS = {
+    "co2":          {"start": 3000, "danger": "high", "caution": 5000, "warning": 7000, "unit": "ppm"},
+    "o2":           {"start": 20.9, "danger": "low",  "caution": 19.5, "warning": 18,   "unit": "%"},
+    "pressure":     {"start": 101,  "danger": "low",  "caution": 96,   "warning": 90,   "unit": "kPa"},
+    "cabin_temp":   {"start": 22,   "danger": "high", "caution": 27,   "warning": 32,   "unit": "C"},
+    "battery":      {"start": 90,   "danger": "low",  "caution": 30,   "warning": 15,   "unit": "%"},
+    "coolant_temp": {"start": 18,   "danger": "high", "caution": 30,   "warning": 38,   "unit": "C"},
+}
+
+# if a question has one of these (or a sensor name), it's about the ship, so we don't refuse it
+STATUS_WORDS = ["status", "how is", "how's", "current"]
+
+# green / yellow / red dot for each level
+EMOJI = {"OK": "🟢", "CAUTION": "🟡", "WARNING": "🔴"}
 
 
 # read all the PDFs once and keep the chunks in memory
@@ -90,20 +136,105 @@ def search(question):
     return results
 
 
+# send a system prompt and a user message to the local model, get its text back
+def ask_llm(system_text, user_text):
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+        # temperature 0 so it doesn't get creative
+        options={"temperature": 0},
+    )
+    return response["message"]["content"]
+
+
+# ask the LLM for 5 search words, since BM25 only matches exact words
+def get_keywords(question):
+    reply = ask_llm(
+        "You turn questions into search keywords for a NASA manual. "
+        "Reply with exactly 5 keywords separated by spaces. No numbering, no other text.",
+        question,
+    )
+
+    # clean up the reply in case it added commas, numbers or bullets
+    keywords = []
+    for word in reply.replace(",", " ").split():
+        word = word.strip(".:;-*\"'()").lower()
+        if word == "" or word.isdigit():
+            continue
+        keywords.append(word)
+
+    # if the LLM gave us nothing useful, just fall back to the question itself
+    if len(keywords) == 0:
+        return question
+
+    # it sometimes gives more than 5, so only keep the first 5
+    return " ".join(keywords[:5])
+
+
 # all the reply logic lives here so later phases can reuse it
-# for now it just hands back the best chunk with its [file p.N] label
-def answer(question):
-    results = search(question)
+# previous_question and previous_reply are the last turn, so follow-ups like "where does it say that?" work
+def answer(question, previous_question="", previous_reply=""):
+    # status questions skip the refusal, and so does anything asked while an alarm is on
+    # (so "what should I do?" still works during the CO2 fault)
+    alerts = alert_sensors()
+    status_question = is_status_question(question) or len(alerts) > 0
+
+    # mix in the last question so a follow-up still finds the same pages,
+    # plus any sensor that's acting up so its manual pages come up too
+    search_text = previous_question + " " + question
+    for name in alerts:
+        search_text = search_text + " " + name.replace("_", " ")
+
+    # search with the question AND the keywords, so we don't lose the original words
+    keywords = get_keywords(search_text)
+    results = search(search_text + " " + keywords)
     if len(results) == 0:
         return "No manuals loaded, so there is nothing to search.", []
 
-    top_chunk = results[0][0]
-    file_name = top_chunk[0]
-    page_number = top_chunk[1]
-    text = top_chunk[2]
+    # best match is too weak, so refuse instead of letting the LLM guess
+    best_score = results[0][1]
+    if best_score < MIN_SCORE:
+        if not status_question:
+            return NOT_FOUND, []
+        # weak match but it's about the ship, so answer from the live numbers with no excerpts
+        results = []
 
-    reply_text = text + " [" + file_name + " p." + str(page_number) + "]"
-    excerpts_used = [top_chunk]
+    # glue the 3 excerpts together, each with its [file p.N] label
+    excerpts_text = ""
+    excerpts_used = []
+    for chunk, score in results:
+        label = "[" + chunk[0] + " p." + str(chunk[1]) + "]"
+        excerpts_text = excerpts_text + label + "\n" + chunk[2] + "\n\n"
+        excerpts_used.append(chunk)
+
+    if excerpts_text == "":
+        excerpts_text = "(none)\n"
+
+    # the LLM gets the rules, the live sensor numbers, then the manual excerpts
+    system_text = (
+        SYSTEM_RULES
+        + "\n\nLIVE SHIP STATUS:\n" + status_text()
+        + "\n\nManual excerpts:\n\n" + excerpts_text
+    )
+
+    # give the LLM the last turn too, if there was one
+    user_text = question
+    if previous_question != "":
+        user_text = (
+            "Previous question: " + previous_question + "\n"
+            + "Previous answer: " + previous_reply + "\n\n"
+            + "New question: " + question
+        )
+
+    reply_text = ask_llm(system_text, user_text)
+
+    # if the LLM refused, just show the refusal, not a made-up source line
+    if NOT_FOUND in reply_text:
+        return NOT_FOUND, []
+
     return reply_text, excerpts_used
 
 
@@ -157,20 +288,160 @@ def speak(text):
 
 # one place that handles a question, typed or spoken, so both look the same in the chat
 def handle_question(text):
+    # grab the last question and answer before we add the new one
+    previous_question = ""
+    previous_reply = ""
+    messages = st.session_state["messages"]
+    if len(messages) >= 2:
+        previous_question = messages[-2]["content"]
+        previous_reply = messages[-1]["content"]
+
     # show the question and save it in the history
     with st.chat_message("user"):
         st.write(text)
     st.session_state["messages"].append({"role": "user", "content": text})
 
-    # get the answer, show it, and save it too
-    reply_text, excerpts_used = answer(text)
+    # get the answer, show it with its excerpts, and save it too
     with st.chat_message("assistant"):
+        with st.spinner("NOVA is thinking..."):
+            reply_text, excerpts_used = answer(text, previous_question, previous_reply)
         st.write(reply_text)
-    st.session_state["messages"].append({"role": "assistant", "content": reply_text})
+        show_excerpts(excerpts_used)
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": reply_text, "excerpts": excerpts_used}
+    )
 
     # read the reply out loud if the checkbox is on
     if speak_answers:
         speak(reply_text)
+
+
+# little dropdown under an answer showing which excerpts it used
+def show_excerpts(excerpts):
+    if len(excerpts) == 0:
+        return
+    with st.expander("Excerpts used"):
+        for chunk in excerpts:
+            st.markdown("**" + chunk[0] + " p." + str(chunk[1]) + "**")
+            st.write(chunk[2])
+
+
+# compare a reading against that sensor's limits
+def get_level(name, value):
+    s = SENSORS[name]
+    if s["danger"] == "high":
+        if value >= s["warning"]:
+            return "WARNING"
+        if value >= s["caution"]:
+            return "CAUTION"
+    else:
+        if value <= s["warning"]:
+            return "WARNING"
+        if value <= s["caution"]:
+            return "CAUTION"
+    return "OK"
+
+
+# every sensor begins at its start number
+def start_values():
+    values = {}
+    for name in SENSORS:
+        values[name] = SENSORS[name]["start"]
+    return values
+
+
+# nudge every sensor a little, runs once a second
+def step():
+    values = st.session_state["values"]
+    for name in SENSORS:
+        start = SENSORS[name]["start"]
+        if name == "battery":
+            # battery only goes down, slowly
+            values[name] = max(0, values[name] - 0.02)
+        elif name == "co2" and st.session_state["co2_fault"]:
+            # scrubber is broken so co2 keeps climbing
+            values[name] = values[name] + 60 + random.uniform(-10, 10)
+        else:
+            # small wobble, pulled back toward normal so nothing alerts by accident
+            wiggle = start * random.uniform(-0.002, 0.002)
+            values[name] = values[name] + wiggle + (start - values[name]) * 0.1
+
+
+# big numbers look cleaner without decimals
+def nice_number(value):
+    if value >= 100:
+        return str(round(value))
+    return str(round(value, 1))
+
+
+# names of the sensors that are red right now
+def sensors_at_warning():
+    names = []
+    for name in SENSORS:
+        if get_level(name, st.session_state["values"][name]) == "WARNING":
+            names.append(name)
+    return names
+
+
+# one line per sensor, this is what the LLM sees as LIVE SHIP STATUS
+def status_text():
+    lines = []
+    for name in SENSORS:
+        value = st.session_state["values"][name]
+        unit = SENSORS[name]["unit"]
+        level = get_level(name, value)
+        lines.append(name + ": " + nice_number(value) + " " + unit + " (" + level + ")")
+    return "\n".join(lines)
+
+
+# names of the sensors that are yellow or red right now
+def alert_sensors():
+    names = []
+    for name in SENSORS:
+        if get_level(name, st.session_state["values"][name]) != "OK":
+            names.append(name)
+    return names
+
+
+# true if the question is about the ship itself, so we skip the MIN_SCORE refusal
+def is_status_question(question):
+    q = question.lower()
+    for word in STATUS_WORDS:
+        if word in q:
+            return True
+    for name in SENSORS:
+        if name in q or name.replace("_", " ") in q:
+            return True
+    return False
+
+
+# reruns by itself every second without wiping the chat
+@st.fragment(run_every=1)
+def dashboard():
+    step()
+    for name in SENSORS:
+        value = st.session_state["values"][name]
+        level = get_level(name, value)
+        st.metric(EMOJI[level] + " " + name, nice_number(value) + " " + SENSORS[name]["unit"])
+
+
+# red box at the top when anything hits WARNING
+@st.fragment(run_every=1)
+def warning_banner():
+    names = sensors_at_warning()
+    if len(names) > 0:
+        st.error("WARNING: " + ", ".join(names))
+
+
+# demo button: pretend the CO2 scrubber just broke
+def inject_fault():
+    st.session_state["co2_fault"] = True
+
+
+# demo button: fix the scrubber and put CO2 back to normal
+def clear_fault():
+    st.session_state["co2_fault"] = False
+    st.session_state["values"]["co2"] = SENSORS["co2"]["start"]
 
 
 # hide the default person and robot icons next to chat messages
@@ -189,6 +460,14 @@ st.markdown(
 st.title("Offline Space Copilot, NOVA")
 st.caption("NOVA runs fully offline on this laptop. No internet, no cloud.")
 
+# sensor readings and the fault switch, set up once
+if "values" not in st.session_state:
+    st.session_state["values"] = start_values()
+if "co2_fault" not in st.session_state:
+    st.session_state["co2_fault"] = False
+
+warning_banner()
+
 chunks, pdf_count = load_manuals()
 
 # show what got loaded in the sidebar
@@ -198,6 +477,14 @@ if pdf_count == 0:
 else:
     st.sidebar.write("PDFs loaded: " + str(pdf_count))
     st.sidebar.write("Chunks loaded: " + str(len(chunks)))
+
+# live ship status and the demo fault buttons
+with st.sidebar:
+    st.header("Ship status (simulated)")
+    dashboard()
+    # on_click runs before the page redraws, so the change shows up right away
+    st.button("Inject CO2 scrubber fault", on_click=inject_fault)
+    st.button("Clear fault", on_click=clear_fault)
 
 # voice settings, on by default
 st.sidebar.header("Voice")
@@ -234,9 +521,13 @@ if "messages" not in st.session_state:
 for message in st.session_state["messages"]:
     with st.chat_message(message["role"]):
         st.write(message["content"])
+        if message["role"] == "assistant":
+            # .get so older messages without excerpts don't crash
+            show_excerpts(message.get("excerpts", []))
 
 # typed questions and voice questions both go through handle_question
 question = st.chat_input("Ask NOVA about the manuals")
+st.caption("Read-only assistant: it advises, the crew decides.")
 if question:
     handle_question(question)
 if voice_question != "":
