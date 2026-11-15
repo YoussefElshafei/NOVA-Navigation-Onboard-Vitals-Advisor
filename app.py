@@ -1,4 +1,7 @@
 import os
+import io
+import hashlib
+import threading
 
 # turn this on later, once Whisper has downloaded its model one time
 # os.environ["HF_HUB_OFFLINE"] = "1"
@@ -6,6 +9,9 @@ import os
 import streamlit as st
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
+from faster_whisper import WhisperModel
+import pyttsx3
+import pythoncom  # comes with pyttsx3 on windows
 
 MANUALS_FOLDER = "manuals"
 CHUNK_WORDS = 150
@@ -101,6 +107,72 @@ def answer(question):
     return reply_text, excerpts_used
 
 
+# load the whisper speech-to-text model once, it's slow to load so we cache it
+# the very first run downloads it (needs internet), after that it's all local
+@st.cache_resource
+def load_whisper():
+    return WhisperModel("base", device="cpu", compute_type="int8")
+
+
+# turn a voice recording into text, all on this laptop
+def transcribe(audio_bytes):
+    model = load_whisper()
+
+    # we only talk english, so tell whisper that instead of making it guess
+    segments, info = model.transcribe(io.BytesIO(audio_bytes), language="en")
+
+    # whisper hands back the speech in little pieces, so glue them together
+    text = ""
+    for segment in segments:
+        text = text + segment.text
+    return text.strip()
+
+
+# one shared lock so only one voice talks at a time
+# two at once makes pyttsx3 crash with "run loop already started"
+@st.cache_resource
+def get_speak_lock():
+    return threading.Lock()
+
+
+# this runs in the background thread and does the actual talking
+def say_out_loud(text, lock):
+    # wait for our turn if something else is already talking
+    with lock:
+        # windows needs this in every new thread before it can use the voice
+        pythoncom.CoInitialize()
+
+        # make a NEW engine every time, reusing one tends to hang on windows
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+
+
+# read text out loud in the background so the app doesn't freeze while it talks
+def speak(text):
+    lock = get_speak_lock()
+    thread = threading.Thread(target=say_out_loud, args=(text, lock))
+    thread.start()
+
+
+# one place that handles a question, typed or spoken, so both look the same in the chat
+def handle_question(text):
+    # show the question and save it in the history
+    with st.chat_message("user"):
+        st.write(text)
+    st.session_state["messages"].append({"role": "user", "content": text})
+
+    # get the answer, show it, and save it too
+    reply_text, excerpts_used = answer(text)
+    with st.chat_message("assistant"):
+        st.write(reply_text)
+    st.session_state["messages"].append({"role": "assistant", "content": reply_text})
+
+    # read the reply out loud if the checkbox is on
+    if speak_answers:
+        speak(reply_text)
+
+
 # hide the default person and robot icons next to chat messages
 st.markdown(
     """
@@ -127,6 +199,33 @@ else:
     st.sidebar.write("PDFs loaded: " + str(pdf_count))
     st.sidebar.write("Chunks loaded: " + str(len(chunks)))
 
+# voice settings, on by default
+st.sidebar.header("Voice")
+speak_answers = st.sidebar.checkbox("Speak answers", value=True)
+
+# remember which recording we already used, so reruns don't send it again
+if "last_audio_id" not in st.session_state:
+    st.session_state["last_audio_id"] = ""
+
+# push to talk: record a question with the mic
+voice_question = ""
+audio = st.audio_input("Ask NOVA with your voice")
+if audio is not None:
+    audio_bytes = audio.getvalue()
+
+    # hash the recording to get a fingerprint, same audio = same fingerprint
+    audio_id = hashlib.md5(audio_bytes).hexdigest()
+
+    # only run whisper when it's a new recording
+    if audio_id != st.session_state["last_audio_id"]:
+        with st.spinner("Turning your voice into text..."):
+            voice_question = transcribe(audio_bytes)
+        st.session_state["last_audio_id"] = audio_id
+
+        # whisper heard nothing, so let the user know
+        if voice_question == "":
+            st.caption("Didn't catch that, try recording again.")
+
 # keep the chat history between reruns
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
@@ -136,14 +235,9 @@ for message in st.session_state["messages"]:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-# when the user sends something, show it, answer it, and save both
+# typed questions and voice questions both go through handle_question
 question = st.chat_input("Ask NOVA about the manuals")
 if question:
-    with st.chat_message("user"):
-        st.write(question)
-    st.session_state["messages"].append({"role": "user", "content": question})
-
-    reply_text, excerpts_used = answer(question)
-    with st.chat_message("assistant"):
-        st.write(reply_text)
-    st.session_state["messages"].append({"role": "assistant", "content": reply_text})
+    handle_question(question)
+if voice_question != "":
+    handle_question(voice_question)
