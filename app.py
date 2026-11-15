@@ -8,8 +8,9 @@ import hashlib
 import threading
 import random
 
-# turn this on later, once Whisper has downloaded its model one time
-# os.environ["HF_HUB_OFFLINE"] = "1"
+# offline mode so whisper never tries to download stuff
+# has to be above the faster_whisper import, and the model needs to be downloaded once first
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 import streamlit as st
 import ollama
@@ -238,8 +239,8 @@ def answer(question, previous_question="", previous_reply=""):
     return reply_text, excerpts_used
 
 
-# load the whisper speech-to-text model once, it's slow to load so we cache it
-# the very first run downloads it (needs internet), after that it's all local
+# load the whisper speech-to-text model once, it's slow so we cache it
+# offline mode is on so it just loads it from the laptop
 @st.cache_resource
 def load_whisper():
     return WhisperModel("base", device="cpu", compute_type="int8")
@@ -424,6 +425,19 @@ def dashboard():
         level = get_level(name, value)
         st.metric(EMOJI[level] + " " + name, nice_number(value) + " " + SENSORS[name]["unit"])
 
+        # say it out loud once when a sensor first goes red (rules only, no LLM)
+        announced = st.session_state["announced"]
+        if level == "WARNING" and name not in announced:
+            announced.add(name)
+            if speak_alerts:
+                spoken_name = name.replace("_", " ").upper()
+                unit = SENSORS[name]["unit"]
+                speak("Warning. " + spoken_name + " at " + nice_number(value) + " " + unit + ".")
+
+        # back to normal, so it's allowed to warn again next time
+        if level == "OK" and name in announced:
+            announced.remove(name)
+
 
 # red box at the top when anything hits WARNING
 @st.fragment(run_every=1)
@@ -465,10 +479,15 @@ if "values" not in st.session_state:
     st.session_state["values"] = start_values()
 if "co2_fault" not in st.session_state:
     st.session_state["co2_fault"] = False
+# sensors we already said a warning for, so we don't repeat it every second
+if "announced" not in st.session_state:
+    st.session_state["announced"] = set()
 
 warning_banner()
 
 chunks, pdf_count = load_manuals()
+
+st.sidebar.caption("Offline mode: everything runs on this device")
 
 # show what got loaded in the sidebar
 st.sidebar.header("Manuals")
@@ -478,6 +497,12 @@ else:
     st.sidebar.write("PDFs loaded: " + str(pdf_count))
     st.sidebar.write("Chunks loaded: " + str(len(chunks)))
 
+# voice settings, on by default
+# (these have to come before the dashboard, since it checks speak_alerts)
+st.sidebar.header("Voice")
+speak_answers = st.sidebar.checkbox("Speak answers", value=True)
+speak_alerts = st.sidebar.checkbox("Speak alerts", value=True)
+
 # live ship status and the demo fault buttons
 with st.sidebar:
     st.header("Ship status (simulated)")
@@ -485,10 +510,6 @@ with st.sidebar:
     # on_click runs before the page redraws, so the change shows up right away
     st.button("Inject CO2 scrubber fault", on_click=inject_fault)
     st.button("Clear fault", on_click=clear_fault)
-
-# voice settings, on by default
-st.sidebar.header("Voice")
-speak_answers = st.sidebar.checkbox("Speak answers", value=True)
 
 # remember which recording we already used, so reruns don't send it again
 if "last_audio_id" not in st.session_state:
